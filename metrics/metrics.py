@@ -8,7 +8,7 @@ from utils import hinge_loss
 
 
 class SST2Metric(MetricBase):
-    def __init__(self, pred=None, target=None, seq_len=None, tokenizer=None):
+    def __init__(self, pred=None, target=None, seq_len=None, tokenizer=None, stu_tokenizer=None):
         super().__init__()
         self._init_param_map(pred=pred, target=target, seq_len=seq_len)
         self._pred = []
@@ -22,6 +22,10 @@ class SST2Metric(MetricBase):
         self.label_map = {
             tokenizer.encode('bad', add_special_tokens=False)[0]: 0,  # negative
             tokenizer.encode('great', add_special_tokens=False)[0]: 1,  # positive
+        }
+        self.stu_label_map = {
+            stu_tokenizer.encode('bad', add_special_tokens=False)[0]: 0,  # negative
+            stu_tokenizer.encode('great', add_special_tokens=False)[0]: 1,  # positive
         }
 
     def evaluate(self, pred, target, seq_len=None):

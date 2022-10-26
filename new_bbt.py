@@ -1,16 +1,19 @@
 import os
 import copy
 import time
+import math
 import random
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 # import fitlog
 import argparse
 import numpy as np
 import cma
 from fastNLP import cache_results, Tester, DataSet
 from transformers import (
+    AdamW,
     RobertaConfig,
     RobertaTokenizer,
     BertConfig,
@@ -24,6 +27,7 @@ from transformers import (
     GPT2Config,
     GPT2Tokenizer,
     BartConfig as CPTConfig,
+    get_linear_schedule_with_warmup,
 )
 from models.modeling_roberta import RobertaForMaskedLM
 from models.modeling_bart import BartForConditionalGeneration
@@ -79,8 +83,13 @@ parser.add_argument(
 )
 
 # for student model
-parser.add_argument("--student_model_name", default='bert-base-uncased', type=str)
-parser.add_argument("--student_model_path", default='bert-base-uncased', type=str)
+parser.add_argument("--student_model_name", default='bert-large-uncased', type=str)
+parser.add_argument("--student_model_path", default='bert-large-uncased', type=str)
+parser.add_argument("--weight_decay", default=0.0, type=float)
+parser.add_argument("--warmup_ratio", default=0.06, type=float)
+parser.add_argument("--warmup_steps", default=0, type=int)
+parser.add_argument("--learning_rate", default=1e-4, type=float)
+parser.add_argument("--adam_epsilon", default=1e-8, type=float)
 
 args = parser.parse_args()
 
@@ -266,6 +275,38 @@ class LMForwardAPI:
                 config=self.stu_config,
                 n_prompt_tokens=n_prompt_tokens,
             )
+            
+            # 优化器
+            no_decay = ["bias", "LayerNorm.weight"]
+            optimizer_grouped_parameters = []
+            optimizer_grouped_parameters.extend(
+                [
+                    {
+                        "params": [
+                            p
+                            for n, p in self.stu_model.named_parameters()
+                            if not any(nd in n for nd in no_decay)
+                        ],
+                        "weight_decay": args.weight_decay,
+                    },
+                    {
+                        "params": [
+                            p
+                            for n, p in self.stu_model.named_parameters()
+                            if any(nd in n for nd in no_decay)
+                        ],
+                        "weight_decay": 0.0,
+                    },
+                ]
+            )
+            warmup_steps = math.ceil(args.budget * args.warmup_ratio)
+            args.warmup_steps = warmup_steps if args.warmup_steps == 0 else args.warmup_steps
+        
+            self.optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+            self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.budget
+            )
+             
         else:
             raise NotImplementedError
         self.KLDivLoss = nn.KLDivLoss(reduction='mean')
@@ -315,7 +356,9 @@ class LMForwardAPI:
             for p in self.linear.parameters():
                 torch.nn.init.normal_(p, mu, std)
         self.best_train_perf = 0.0
+        self.stu_best_train_perf = 0.0
         self.best_dev_perf = 0.0
+        self.stu_best_dev_perf = 0.0
         self.best_prompt = None
         self.num_call = 0
         # self.save_path = save_path
@@ -325,7 +368,7 @@ class LMForwardAPI:
         # if save_path is not None:
         #     os.makedirs(save_path, exist_ok=True)
         if task_name == 'sst2':
-            self.metric = SST2Metric(target='labels', pred='logits', tokenizer=tokenizer)
+            self.metric = SST2Metric(target='labels', pred='logits', tokenizer=tokenizer, stu_tokenizer=stu_tokenizer)
             self.metric_key = 'acc'
             self.metric_name = 'SST2Metric'
         elif task_name == 'agnews':
@@ -426,7 +469,53 @@ class LMForwardAPI:
 
         return loss, perf
 
+    def calc_stu_loss(self, loss_func, logits, target, stu_logits, stu_target):
+        label_map = self.metric.label_map
+        converted_target = target.clone()
+        for key, val in label_map.items():
+            converted_target[target == key] = val
+        interest_index = list(label_map.keys())
+        logits = logits[:, interest_index]
+        pred = logits.argmax(dim=-1)
+        
+        stu_label_map = self.metric.stu_label_map
+        stu_converted_target = stu_target.clone()
+        for key, val in stu_label_map.items():
+            stu_converted_target[stu_target == key] = val
+        stu_interest_index = list(stu_label_map.keys())
+        stu_logits = stu_logits[:, stu_interest_index]
+        stu_pred = stu_logits.argmax(dim=-1)
+        # pred = logits.argmax(dim=-1)F.log_softmax(probs / temp, dim=1)
+        
+        stu_loss = loss_func(F.log_softmax(stu_logits, dim=1), F.softmax(logits, dim=1))
+
+        if self.metric_key == 'acc':
+            perf = (pred == converted_target).sum() / len(target)
+            stu_perf = (stu_pred == stu_converted_target).sum() / len(stu_target)
+        elif self.metric_key == 'f1':
+            perf = f1_score(converted_target.detach().cpu().numpy().tolist(),
+                            pred.detach().cpu().numpy().tolist())
+            stu_perf = f1_score(stu_converted_target.detach().cpu().numpy().tolist(),
+                            stu_pred.detach().cpu().numpy().tolist())
+        else:
+            raise KeyError(f'[Metric] Only support [acc, f1], got {self.metric_key} instead.')
+
+        if self.loss_type == 'hinge':
+            loss = hinge_loss(logits, converted_target, margin=self.margin, reduction='sum').item() / len(target)
+        elif self.loss_type == 'ce':
+            loss = self.ce_loss(logits, converted_target).item()
+        elif self.loss_type == 'perf':
+            loss = -1 * perf
+        else:
+            raise KeyError(f'[Loss] Only support [hinge, ce, perf], got {self.loss_type} instead.')
+
+        return stu_loss, loss, perf, stu_perf
+
+
+
     def eval(self, prompt_embedding=None, test_data=None):
+        self.stu_model.train()
+        self.model.eval()
         self.num_call += 1
         if prompt_embedding is None:
             prompt_embedding = self.best_prompt
@@ -494,33 +583,42 @@ class LMForwardAPI:
             
             # TO DO: 把这里的logits存下来作为训练集的Y
             stu_logits = self.stu_model(
-                        input_ids=train_data['input_ids'],
-                        attention_mask=train_data['attention_mask'],
-                        mask_pos=train_data['mask_pos'],
+                        input_ids=train_data['stu_input_ids'],
+                        attention_mask=train_data['stu_attention_mask'],
+                        mask_pos=train_data['stu_mask_pos'],
                     )['logits']
 
-            stu_loss = self.KLDivLoss(stu_logits, logits)
+            # stu_loss = self.KLDivLoss(stu_logits, logits)
 
-            if parallel:  # we have multiple queries
-                all_losses, all_perfs = [], []
-                for i in range(len(logits) // bsz):
-                    tmp_logits = logits[i * bsz:i * bsz + bsz]
-                    tmp_target = train_data['labels'][i * bsz:i * bsz + bsz]
-                    tmp_loss, tmp_perf = self.calc_metric(tmp_logits, tmp_target)
-                    all_losses.append(tmp_loss)
-                    all_perfs.append(tmp_perf)
-                loss = min(all_losses)
-                best_sol = all_losses.index(loss)  # argmin
-                perf = all_perfs[best_sol]  # corresponding performance
-                tmp_prompt = tmp_prompt[best_sol]  # numpy.ndarray
-                prompt_embedding = pe_list[best_sol]  # to be prepended to the input
-            else:  # single query
-                loss, perf = self.calc_metric(logits, train_data['labels'])
-            # fitlog.add_loss(loss, name=self.loss_type, step=self.num_call)
-            # fitlog.add_metric(perf, name='train_acc', step=self.num_call)
+            # if parallel:  # we have multiple queries
+            #     all_losses, all_perfs = [], []
+            #     for i in range(len(logits) // bsz):
+            #         tmp_logits = logits[i * bsz:i * bsz + bsz]
+            #         tmp_target = train_data['labels'][i * bsz:i * bsz + bsz]
+            #         tmp_loss, tmp_perf = self.calc_metric(tmp_logits, tmp_target)
+            #         all_losses.append(tmp_loss)
+            #         all_perfs.append(tmp_perf)
+            #     loss = min(all_losses)
+            #     best_sol = all_losses.index(loss)  # argmin
+            #     perf = all_perfs[best_sol]  # corresponding performance
+            #     tmp_prompt = tmp_prompt[best_sol]  # numpy.ndarray
+            #     prompt_embedding = pe_list[best_sol]  # to be prepended to the input
+            # else:  # single query
+            #     loss, perf = self.calc_metric(logits, train_data['labels'])
+            
+            
+            
+            stu_loss, loss, perf, stu_perf = self.calc_stu_loss(self.KLDivLoss, logits, train_data['labels'], stu_logits, train_data['stu_labels'])
 
+            self.stu_model.zero_grad()
+            stu_loss.backward()
+            self.optimizer.step()
+            self.scheduler.step()
+            
             if perf > self.best_train_perf:
                 self.best_train_perf = perf
+            if stu_perf > self.stu_best_train_perf:
+                self.stu_best_train_perf = stu_perf
                 # fitlog.add_best_metric(self.best_train_perf, name='train_acc')
 
             # if self.save_path is not None:
@@ -529,11 +627,14 @@ class LMForwardAPI:
 
             if self.num_call % self.print_every == 0:
                 print(
-                    '[# API Calls {}] loss: {}. Current perf: {}. Best perf so far: {}'.format(
+                    '[# API Calls {}] loss: {}. stu_loss: {}. Current perf: {}. Best perf so far: {}. Current stu_perf: {}. Best stu_perf so far: {}'.format(
                         self.num_call,
                         round(float(loss), 4),
+                        round(float(stu_loss), 4),
                         round(float(perf), 4),
-                        round(float(self.best_train_perf), 4)))
+                        round(float(stu_perf), 4),
+                        round(float(self.best_train_perf), 4),
+                        round(float(self.stu_best_train_perf), 4)))
 
             if self.num_call % self.eval_every == 0:
                 print('********* Evaluated on dev set *********')
@@ -561,22 +662,42 @@ class LMForwardAPI:
                             mask_pos=dev_data['mask_pos'],
                         )['logits']
 
-                dev_loss, dev_perf = self.calc_metric(logits, dev_data['labels'])
+                stu_logits = self.stu_model(
+                        input_ids=train_data['stu_input_ids'],
+                        attention_mask=train_data['stu_attention_mask'],
+                        mask_pos=train_data['stu_mask_pos'],
+                    )['logits']
+                # dev_loss, dev_perf = self.calc_metric(logits, dev_data['labels'])
+                dev_stu_loss, dev_loss, dev_perf, dev_stu_perf = self.calc_stu_loss(self.KLDivLoss, logits, dev_data['labels'], stu_logits, dev_data['stu_labels'])
+
                 # fitlog.add_metric(dev_perf, name='dev_acc', step=self.num_call)
                 if dev_perf > self.best_dev_perf:
                     self.best_dev_perf = dev_perf
                     # fitlog.add_best_metric(self.best_dev_perf, name='dev_acc')
                     self.best_prompt = copy.deepcopy(tmp_prompt)
+                if dev_stu_perf > self.stu_best_dev_perf:
+                    self.stu_best_dev_perf = dev_stu_perf
                 # if self.save_path is not None:
                 #     with open(os.path.join(self.save_path, 'dev_acc.txt'), 'a') as fout:
                 #         fout.write('{}\t{}\n'.format(self.num_call, dev_loss))
-                print('Dev loss: {}. Dev perf: {}. Best dev perf: {}'.format(
+                print('Dev loss: {}. Dev stu_loss: {}. Dev perf: {}. Dev stu_perf: {}. Best dev perf: {}. Best dev stu_perf: {}'.format(
                     round(float(dev_loss), 4),
+                    round(float(dev_stu_loss), 4),
                     round(float(dev_perf), 4),
-                    round(float(self.best_dev_perf), 4)))
+                    round(float(dev_stu_perf), 4),
+                    round(float(self.best_dev_perf), 4),
+                    round(float(self.stu_best_dev_perf), 4)))
                 print('********* Done *********')
+            
+            STU_PATH = 'sst2-bert-large-8000-epoch.pt'
+            if self.num_call == self.args.budget:
+                print("num_call:", self.num_call)
+                torch.save(self.stu_model.state_dict(), STU_PATH)
+                print("Finish Save StuModel.")
+                
             if parallel:
-                return all_losses
+                raise NotImplementedError
+                # return all_losses
             else:
                 return loss
 
@@ -593,6 +714,11 @@ elif model_name in ['t5-small', 't5-base', 't5-large', 't5-3b']:
     tokenizer = T5Tokenizer.from_pretrained(model_path)
 elif model_name in ['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl']:
     tokenizer = GPT2Tokenizer.from_pretrained(model_path)
+else:
+    raise NotImplementedError
+
+if args.student_model_name in ['bert-base-uncased', 'bert-large-uncased', 'fnlp/cpt-large']:
+    stu_tokenizer = BertTokenizer.from_pretrained(args.student_model_path)
 else:
     raise NotImplementedError
 
@@ -622,8 +748,8 @@ else:
     }
 
 
-@cache_results(cache_fn, _refresh=True)
-def get_data(task_name, tokenizer):
+@cache_results(cache_fn, _refresh=False)
+def get_data(task_name, tokenizer, args, stu_tokenizer):
     if task_name in ['agnews', 'yelpp', 'dbpedia', 'snli']:
         splits = ['train', 'test']
     else:  # for datasets without test set, we use dev set
@@ -631,7 +757,7 @@ def get_data(task_name, tokenizer):
     if args.cat_or_add == 'cat':
         data_bundle = DataLoader[task_name](tokenizer=tokenizer, n_prompt_tokens=0).my_load(splits)
     else:
-        data_bundle = DataLoader[task_name](tokenizer=tokenizer, n_prompt_tokens=n_prompt_tokens).my_load(splits)
+        data_bundle = DataLoader[task_name](args=args, tokenizer=tokenizer, stu_tokenizer=stu_tokenizer, n_prompt_tokens=n_prompt_tokens).my_load(splits)
     return data_bundle
 
 
@@ -667,15 +793,15 @@ def construct_true_few_shot_data(train_data, k_shot):
         new_train_data.set_input("input_ids", "attention_mask")
         new_dev_data.set_input("input_ids", "attention_mask")
     else:
-        new_train_data.set_input("input_ids", "attention_mask", "mask_pos")
-        new_dev_data.set_input("input_ids", "attention_mask", "mask_pos")
+        new_train_data.set_input("input_ids", "attention_mask", "mask_pos", "stu_input_ids", "stu_attention_mask", "stu_mask_pos")
+        new_dev_data.set_input("input_ids", "attention_mask", "mask_pos", "stu_input_ids", "stu_attention_mask", "stu_mask_pos")
 
-    new_train_data.set_target("labels")
-    new_dev_data.set_target("labels")
+    new_train_data.set_target("labels", "stu_labels")
+    new_dev_data.set_target("labels", "stu_labels")
     return new_train_data, new_dev_data
 
 
-data_bundle = get_data(task_name=task_name, tokenizer=tokenizer)
+data_bundle = get_data(task_name=task_name, tokenizer=tokenizer, args=args, stu_tokenizer=stu_tokenizer)
 if task_name in ['agnews', 'yelpp', 'dbpedia', 'snli']:
     train_data, test_data = data_bundle.get_dataset('train'), data_bundle.get_dataset('test')
 else:
@@ -684,7 +810,9 @@ else:
 train_data, dev_data = construct_true_few_shot_data(train_data, k_shot)
 for ds in [train_data, dev_data, test_data]:
     ds.set_pad_val('input_ids', tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
+    ds.set_pad_val('stu_input_ids', stu_tokenizer.pad_token_id if stu_tokenizer.pad_token_id is not None else 0)
     ds.set_pad_val('attention_mask', 0)
+    ds.set_pad_val('stu_attention_mask', 0)
 print('# of train data: {}'.format(len(train_data)))
 print('Example:')
 print(train_data[0])
@@ -727,12 +855,20 @@ else:
         'attention_mask': torch.tensor(train_data['attention_mask'].get(list(range(len(train_data))))),
         'mask_pos': torch.tensor(train_data['mask_pos'].get(list(range(len(train_data))))),
         'labels': torch.tensor(train_data['labels'].get(list(range(len(train_data))))),
+        'stu_input_ids': torch.tensor(train_data['stu_input_ids'].get(list(range(len(train_data))))),
+        'stu_attention_mask': torch.tensor(train_data['stu_attention_mask'].get(list(range(len(train_data))))),
+        'stu_mask_pos': torch.tensor(train_data['stu_mask_pos'].get(list(range(len(train_data))))),
+        'stu_labels': torch.tensor(train_data['stu_labels'].get(list(range(len(train_data))))),
     }
     dev_data = {
         'input_ids': torch.tensor(dev_data['input_ids'].get(list(range(len(dev_data))))),
         'attention_mask': torch.tensor(dev_data['attention_mask'].get(list(range(len(dev_data))))),
         'mask_pos': torch.tensor(dev_data['mask_pos'].get(list(range(len(dev_data))))),
         'labels': torch.tensor(dev_data['labels'].get(list(range(len(dev_data))))),
+        'stu_input_ids': torch.tensor(dev_data['stu_input_ids'].get(list(range(len(dev_data))))),
+        'stu_attention_mask': torch.tensor(dev_data['stu_attention_mask'].get(list(range(len(dev_data))))),
+        'stu_mask_pos': torch.tensor(dev_data['stu_mask_pos'].get(list(range(len(dev_data))))),
+        'stu_labels': torch.tensor(dev_data['stu_labels'].get(list(range(len(dev_data))))),
     }
 
 model_forward_api = LMForwardAPI(
@@ -777,7 +913,6 @@ while not es.stop():
     # es.disp()
 end_time = time.time()
 print('Done. Elapsed time: {} (mins)'.format((end_time - start_time) / 60))
-print('Evaluate on test data...')
-test_acc = model_forward_api.eval(test_data=test_data)
-print('Test acc: {}'.format(round(test_acc, 4)))
-# fitlog.finish()
+# print('Evaluate on test data...')
+# test_acc = model_forward_api.eval(test_data=test_data)
+# print('Test acc: {}'.format(round(test_acc, 4)))
