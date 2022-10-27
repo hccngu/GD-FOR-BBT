@@ -91,6 +91,7 @@ parser.add_argument("--warmup_ratio", default=0.06, type=float)
 parser.add_argument("--warmup_steps", default=0, type=int)
 parser.add_argument("--learning_rate", default=1e-4, type=float)
 parser.add_argument("--adam_epsilon", default=1e-8, type=float)
+parser.add_argument("--T", default=0, type=float)
 
 args = parser.parse_args()
 
@@ -502,7 +503,7 @@ class LMForwardAPI:
         # pred = logits.argmax(dim=-1)F.log_softmax(probs / temp, dim=1)
         
         if self.args.loss_func == 'KLDivLoss': 
-            stu_loss = loss_function(F.log_softmax(stu_logits, dim=1), F.softmax(logits, dim=1))
+            stu_loss = loss_function(F.log_softmax(stu_logits/self.args.T, dim=1), F.softmax(logits/self.args.T, dim=1))
         elif self.args.loss_func == 'MSE': 
             stu_loss = loss_function(F.softmax(stu_logits, dim=1), F.softmax(logits, dim=1))
         else:
@@ -687,7 +688,7 @@ class LMForwardAPI:
                         mask_pos=train_data['stu_mask_pos'],
                     )['logits']
                 # dev_loss, dev_perf = self.calc_metric(logits, dev_data['labels'])
-                dev_stu_loss, dev_loss, dev_perf, dev_stu_perf = self.calc_stu_loss(self.KLDivLoss, logits, dev_data['labels'], stu_logits, dev_data['stu_labels'])
+                dev_stu_loss, dev_loss, dev_perf, dev_stu_perf = self.calc_stu_loss(self.loss_function, logits, dev_data['labels'], stu_logits, dev_data['stu_labels'])
 
                 # fitlog.add_metric(dev_perf, name='dev_acc', step=self.num_call)
                 if dev_perf > self.best_dev_perf:

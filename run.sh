@@ -4,8 +4,9 @@ startTime=`date +%Y%m%d-%H:%M`
 startTime_s=`date +%s`
 
 task_name_lst=(sst2)
-learning_rate_lst=(1e-3)
-loss_func=MSE
+learning_rate_lst=(1e-4)
+loss_func=KLDivLoss
+T=0.5
 
 
 for task_name in "${task_name_lst[@]}"; do
@@ -14,6 +15,7 @@ for task_name in "${task_name_lst[@]}"; do
                   --task_name $task_name \
                   --learning_rate $learning_rate \
                   --loss_func $loss_func \
+                  --T $T \
                   --n_prompt_tokens 50 \
                   --intrinsic_dim 500 \
                   --k_shot 16 \
