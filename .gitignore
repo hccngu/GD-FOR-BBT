@@ -1,7 +1,8 @@
-.fitlog
-.fitconfig
+*.fitlog
+*.fitconfig
 logs
 __pycache__
 caches
 data
 *.log
+*.pty

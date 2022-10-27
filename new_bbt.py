@@ -85,6 +85,7 @@ parser.add_argument(
 # for student model
 parser.add_argument("--student_model_name", default='bert-large-uncased', type=str)
 parser.add_argument("--student_model_path", default='bert-large-uncased', type=str)
+parser.add_argument("--loss_func", default='MSE', type=str, choices=["KLDivLoss", "MSE"])
 parser.add_argument("--weight_decay", default=0.0, type=float)
 parser.add_argument("--warmup_ratio", default=0.06, type=float)
 parser.add_argument("--warmup_steps", default=0, type=int)
@@ -309,7 +310,13 @@ class LMForwardAPI:
              
         else:
             raise NotImplementedError
-        self.KLDivLoss = nn.KLDivLoss(reduction='mean')
+        
+        if args.loss_func == 'KLDivLoss':
+            self.loss_function = nn.KLDivLoss(reduction='mean')
+        elif args.loss_func == 'MSE':
+            self.loss_function = nn.MSELoss(reduction='mean')
+        else:
+            raise NotImplementedError
         #######
         
         if inference_framework == 'ort':
@@ -469,7 +476,7 @@ class LMForwardAPI:
 
         return loss, perf
 
-    def calc_stu_loss(self, loss_func, logits, target, stu_logits, stu_target):
+    def calc_stu_loss(self, loss_function, logits, target, stu_logits, stu_target):
         label_map = self.metric.label_map
         converted_target = target.clone()
         for key, val in label_map.items():
@@ -485,9 +492,21 @@ class LMForwardAPI:
         stu_interest_index = list(stu_label_map.keys())
         stu_logits = stu_logits[:, stu_interest_index]
         stu_pred = stu_logits.argmax(dim=-1)
+        
+        if self.num_call % 50 == 0:
+            tar_temp = F.softmax(logits, dim=1)
+            pred_temp = F.softmax(stu_logits, dim=1)
+            p = list(zip(pred_temp.detach().cpu().numpy().tolist(), tar_temp.detach().cpu().numpy().tolist()))
+            d = [[round(b[0],2), round(b[1],2)] for a in p for b in a]
+            print("------logits: ", d)
         # pred = logits.argmax(dim=-1)F.log_softmax(probs / temp, dim=1)
         
-        stu_loss = loss_func(F.log_softmax(stu_logits, dim=1), F.softmax(logits, dim=1))
+        if self.args.loss_func == 'KLDivLoss': 
+            stu_loss = loss_function(F.log_softmax(stu_logits, dim=1), F.softmax(logits, dim=1))
+        elif self.args.loss_func == 'MSE': 
+            stu_loss = loss_function(F.softmax(stu_logits, dim=1), F.softmax(logits, dim=1))
+        else:
+            raise NotImplementedError
 
         if self.metric_key == 'acc':
             perf = (pred == converted_target).sum() / len(target)
@@ -608,7 +627,7 @@ class LMForwardAPI:
             
             
             
-            stu_loss, loss, perf, stu_perf = self.calc_stu_loss(self.KLDivLoss, logits, train_data['labels'], stu_logits, train_data['stu_labels'])
+            stu_loss, loss, perf, stu_perf = self.calc_stu_loss(self.loss_function, logits, train_data['labels'], stu_logits, train_data['stu_labels'])
 
             self.stu_model.zero_grad()
             stu_loss.backward()
@@ -632,8 +651,8 @@ class LMForwardAPI:
                         round(float(loss), 4),
                         round(float(stu_loss), 4),
                         round(float(perf), 4),
-                        round(float(stu_perf), 4),
                         round(float(self.best_train_perf), 4),
+                        round(float(stu_perf), 4),
                         round(float(self.stu_best_train_perf), 4)))
 
             if self.num_call % self.eval_every == 0:
@@ -689,7 +708,7 @@ class LMForwardAPI:
                     round(float(self.stu_best_dev_perf), 4)))
                 print('********* Done *********')
             
-            STU_PATH = 'sst2-bert-large-8000-epoch.pt'
+            STU_PATH = 'sst2-bert-large-8000-epoch-lr{}.pt'.format(self.args.learning_rate)
             if self.num_call == self.args.budget:
                 print("num_call:", self.num_call)
                 torch.save(self.stu_model.state_dict(), STU_PATH)
