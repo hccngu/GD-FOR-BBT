@@ -85,13 +85,13 @@ parser.add_argument(
 # for student model
 parser.add_argument("--student_model_name", default='bert-large-uncased', type=str)
 parser.add_argument("--student_model_path", default='bert-large-uncased', type=str)
-parser.add_argument("--loss_func", default='MSE', type=str, choices=["KLDivLoss", "MSE"])
+parser.add_argument("--loss_func", default='MSE', type=str, choices=["KLDivLoss", "MSE", "CSE"])
 parser.add_argument("--weight_decay", default=0.0, type=float)
 parser.add_argument("--warmup_ratio", default=0.06, type=float)
 parser.add_argument("--warmup_steps", default=0, type=int)
 parser.add_argument("--learning_rate", default=1e-4, type=float)
 parser.add_argument("--adam_epsilon", default=1e-8, type=float)
-parser.add_argument("--T", default=0, type=float)
+parser.add_argument("--T", default=1, type=float)
 
 args = parser.parse_args()
 
@@ -316,6 +316,8 @@ class LMForwardAPI:
             self.loss_function = nn.KLDivLoss(reduction='mean')
         elif args.loss_func == 'MSE':
             self.loss_function = nn.MSELoss(reduction='mean')
+        elif args.loss_func == 'CSE':
+            self.loss_function = self.CSE
         else:
             raise NotImplementedError
         #######
@@ -506,6 +508,8 @@ class LMForwardAPI:
             stu_loss = loss_function(F.log_softmax(stu_logits/self.args.T, dim=1), F.softmax(logits/self.args.T, dim=1))
         elif self.args.loss_func == 'MSE': 
             stu_loss = loss_function(F.softmax(stu_logits, dim=1), F.softmax(logits, dim=1))
+        elif self.args.loss_func == 'CSE': 
+            stu_loss = loss_function(stu_logits, logits, self.args.T)
         else:
             raise NotImplementedError
 
@@ -531,7 +535,17 @@ class LMForwardAPI:
 
         return stu_loss, loss, perf, stu_perf
 
+    def CSE(self, outputs, targets, T=1):
+        _p = F.log_softmax(outputs / T, dim=1)
+        _q = F.softmax(targets / T, dim=1)
+        _soft_loss = -torch.mean(torch.sum(_q * _p, dim=1))
 
+        _soft_loss = _soft_loss * T * T
+        # _hard_loss = F.cross_entropy(outputs, labels)
+        # loss = alpha * _soft_loss + (1. - alpha) * _hard_loss
+        # return loss
+
+        return _soft_loss
 
     def eval(self, prompt_embedding=None, test_data=None):
         self.stu_model.train()

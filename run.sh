@@ -5,8 +5,8 @@ startTime_s=`date +%s`
 
 task_name_lst=(sst2)
 learning_rate_lst=(1e-4)
-loss_func=KLDivLoss
-T=0.5
+loss_func=CSE
+T=4
 
 
 for task_name in "${task_name_lst[@]}"; do
