@@ -85,7 +85,8 @@ parser.add_argument(
 # for student model
 parser.add_argument("--student_model_name", default='bert-large-uncased', type=str)
 parser.add_argument("--student_model_path", default='bert-large-uncased', type=str)
-parser.add_argument("--loss_func", default='MSE', type=str, choices=["KLDivLoss", "MSE", "CSE"])
+parser.add_argument("--loss_func", default='KLDivLoss', type=str, choices=["KLDivLoss", "MSE", "CSE"])
+parser.add_argument("--stu_loss_func_use_CE", default=False, action='store_true', help='add CE or not')
 parser.add_argument("--weight_decay", default=0.0, type=float)
 parser.add_argument("--warmup_ratio", default=0.06, type=float)
 parser.add_argument("--warmup_steps", default=0, type=int)
@@ -512,6 +513,8 @@ class LMForwardAPI:
             stu_loss = loss_function(stu_logits, logits, self.args.T)
         else:
             raise NotImplementedError
+        if self.args.stu_loss_func_use_CE:
+            stu_loss += self.ce_loss(stu_logits, converted_target)
 
         if self.metric_key == 'acc':
             perf = (pred == converted_target).sum() / len(target)
